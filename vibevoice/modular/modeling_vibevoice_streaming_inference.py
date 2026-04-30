@@ -794,15 +794,21 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
 
                 # [VibePod] Submit acoustic decode to background thread so it overlaps
                 # with acoustic_connector + forward_tts_lm below.
+                # Closure enters torch.inference_mode() because thread pools do not
+                # inherit the caller's PyTorch context manager state.
                 if _decode_executor is not None:
-                    _decode_future = _decode_executor.submit(
-                        self.model.acoustic_tokenizer.decode,
-                        scaled_latent.to(self.model.acoustic_tokenizer.device),
-                        cache=acoustic_cache,
-                        sample_indices=diffusion_indices.to(self.model.acoustic_tokenizer.device),
-                        use_cache=True,
-                        debug=False,
-                    )
+                    _dec_latent = scaled_latent.to(self.model.acoustic_tokenizer.device)
+                    _dec_indices = diffusion_indices.to(self.model.acoustic_tokenizer.device)
+                    def _run_decode(_lat=_dec_latent, _idx=_dec_indices):
+                        with torch.inference_mode():
+                            return self.model.acoustic_tokenizer.decode(
+                                _lat,
+                                cache=acoustic_cache,
+                                sample_indices=_idx,
+                                use_cache=True,
+                                debug=False,
+                            )
+                    _decode_future = _decode_executor.submit(_run_decode)
 
                 acoustic_embed = self.model.acoustic_connector(speech_latent)
                 tts_lm_input_ids = torch.cat([tts_lm_input_ids, torch.ones_like(tts_lm_input_ids[:, -1:])], dim=-1)
@@ -848,12 +854,17 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
                 # [VibePod] Run pos and neg forward_tts_lm in parallel when a cfg
                 # executor is available. The neg pass is submitted to the thread while
                 # the pos pass runs on the main thread, then both results are collected.
+                # The closure enters torch.inference_mode() explicitly because thread
+                # pools do not inherit the caller's PyTorch context manager state.
                 if _cfg_executor is not None:
-                    _neg_future = _cfg_executor.submit(
-                        self.forward_tts_lm,
-                        **tts_lm_negative_model_inputs, **tts_lm_negative_additional_inputs,
-                        return_dict=True, output_attentions=False, output_hidden_states=False,
-                    )
+                    _neg_inputs = {**tts_lm_negative_model_inputs, **tts_lm_negative_additional_inputs}
+                    def _run_neg(_inputs=_neg_inputs):
+                        with torch.inference_mode():
+                            return self.forward_tts_lm(
+                                **_inputs,
+                                return_dict=True, output_attentions=False, output_hidden_states=False,
+                            )
+                    _neg_future = _cfg_executor.submit(_run_neg)
                     tts_lm_outputs = self.forward_tts_lm(
                         **tts_lm_model_inputs, **tts_lm_additional_inputs,
                         return_dict=True, output_attentions=False, output_hidden_states=False,
