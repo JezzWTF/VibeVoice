@@ -768,45 +768,66 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
                     tts_lm_outputs, tts_lm_model_kwargs, is_encoder_decoder=False,
                 )
 
+            # [VibePod] Fetch pipeline executors once per text-window iteration.
+            # _vibepod_decode_executor: overlaps acoustic_decode with tts_lm calls.
+            # _vibepod_cfg_executor:    runs pos/neg forward_tts_lm in parallel.
+            # Both are None by default (CUDA or stock CPU), making this path a no-op.
+            _decode_executor = getattr(self, '_vibepod_decode_executor', None)
+            _cfg_executor = getattr(self, '_vibepod_cfg_executor', None)
             diffusion_indices = torch.LongTensor([0])
             for cur_speech_index in range(TTS_SPEECH_WINDOW_SIZE):
                 positive_condition = tts_lm_outputs.last_hidden_state[diffusion_indices, -1, :]
                 negative_condition = tts_lm_negative_outputs.last_hidden_state[diffusion_indices, -1, :]
-                
+
                 speech_latent = self.sample_speech_tokens(
                     positive_condition,
                     negative_condition,
                     cfg_scale=cfg_scale,
                 ).unsqueeze(1)
-                                
-                # Decode acoustic latent to audio using acoustic streaming cache
-                scaled_latent = speech_latent / self.model.speech_scaling_factor.to(speech_latent.device) - self.model.speech_bias_factor.to(speech_latent.device)
-                audio_chunk = self.model.acoustic_tokenizer.decode(
-                    scaled_latent.to(self.model.acoustic_tokenizer.device),
-                    cache=acoustic_cache,  # Use acoustic-specific cache
-                    sample_indices=diffusion_indices.to(self.model.acoustic_tokenizer.device),
-                    use_cache=True,
-                    debug=False
-                )
-                
-                # Store audio chunks for each sample
-                for i, sample_idx in enumerate(diffusion_indices):
-                    idx = sample_idx.item()
-                    # Only append audio chunk if the sample is not finished
-                    if not finished_tags[idx]:
-                        audio_chunks[idx].append(audio_chunk[i])
 
-                 # Add streaming support here
-                if audio_streamer is not None:
-                    # Stream the audio chunks immediately
-                    audio_streamer.put(audio_chunk, diffusion_indices)
+                # Pre-compute scaled_latent here so both the async and sync decode
+                # paths share the same tensor without recomputing it.
+                scaled_latent = (
+                    speech_latent / self.model.speech_scaling_factor.to(speech_latent.device)
+                    - self.model.speech_bias_factor.to(speech_latent.device)
+                )
+
+                # [VibePod] Submit acoustic decode to background thread so it overlaps
+                # with acoustic_connector + forward_tts_lm below.
+                if _decode_executor is not None:
+                    _decode_future = _decode_executor.submit(
+                        self.model.acoustic_tokenizer.decode,
+                        scaled_latent.to(self.model.acoustic_tokenizer.device),
+                        cache=acoustic_cache,
+                        sample_indices=diffusion_indices.to(self.model.acoustic_tokenizer.device),
+                        use_cache=True,
+                        debug=False,
+                    )
 
                 acoustic_embed = self.model.acoustic_connector(speech_latent)
                 tts_lm_input_ids = torch.cat([tts_lm_input_ids, torch.ones_like(tts_lm_input_ids[:, -1:])], dim=-1)
+                tts_lm_negative_input_ids = torch.cat([tts_lm_negative_input_ids, torch.ones_like(tts_lm_input_ids[:, -1:])], dim=-1)
 
                 if tts_lm_input_ids.shape[1] > tts_lm_generation_config.max_length:
+                    # Resolve or run decode before breaking so the last chunk is kept.
+                    if _decode_executor is not None:
+                        audio_chunk = _decode_future.result()
+                    else:
+                        audio_chunk = self.model.acoustic_tokenizer.decode(
+                            scaled_latent.to(self.model.acoustic_tokenizer.device),
+                            cache=acoustic_cache,
+                            sample_indices=diffusion_indices.to(self.model.acoustic_tokenizer.device),
+                            use_cache=True,
+                            debug=False,
+                        )
+                    for i, sample_idx in enumerate(diffusion_indices):
+                        idx = sample_idx.item()
+                        if not finished_tags[idx]:
+                            audio_chunks[idx].append(audio_chunk[i])
+                    if audio_streamer is not None:
+                        audio_streamer.put(audio_chunk, diffusion_indices)
                     break
-                
+
                 step += 1
                 total_generated_speech_tokens += 1
                 if progress_bar is not None:
@@ -818,10 +839,34 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
                     "tts_text_masks": torch.zeros_like(tts_lm_input_ids[:, -1:]),
                     "lm_last_hidden_state": acoustic_embed,
                 }
-                # Forward pass through the model
-                tts_lm_outputs = self.forward_tts_lm(
-                    **tts_lm_model_inputs, **tts_lm_additional_inputs, return_dict=True, output_attentions=False, output_hidden_states=False,
-                )
+                tts_lm_negative_model_inputs = self.prepare_inputs_for_generation(tts_lm_negative_input_ids, **tts_lm_negative_model_kwargs)
+                tts_lm_negative_additional_inputs = {
+                    "tts_text_masks": torch.zeros_like(tts_lm_negative_input_ids[:, -1:]),
+                    "lm_last_hidden_state": acoustic_embed,
+                }
+
+                # [VibePod] Run pos and neg forward_tts_lm in parallel when a cfg
+                # executor is available. The neg pass is submitted to the thread while
+                # the pos pass runs on the main thread, then both results are collected.
+                if _cfg_executor is not None:
+                    _neg_future = _cfg_executor.submit(
+                        self.forward_tts_lm,
+                        **tts_lm_negative_model_inputs, **tts_lm_negative_additional_inputs,
+                        return_dict=True, output_attentions=False, output_hidden_states=False,
+                    )
+                    tts_lm_outputs = self.forward_tts_lm(
+                        **tts_lm_model_inputs, **tts_lm_additional_inputs,
+                        return_dict=True, output_attentions=False, output_hidden_states=False,
+                    )
+                    tts_lm_negative_outputs = _neg_future.result()
+                else:
+                    tts_lm_outputs = self.forward_tts_lm(
+                        **tts_lm_model_inputs, **tts_lm_additional_inputs, return_dict=True, output_attentions=False, output_hidden_states=False,
+                    )
+                    tts_lm_negative_outputs = self.forward_tts_lm(
+                        **tts_lm_negative_model_inputs, **tts_lm_negative_additional_inputs, return_dict=True, output_attentions=False, output_hidden_states=False,
+                    )
+
                 if cur_speech_index == TTS_SPEECH_WINDOW_SIZE - 1 and next_text_window_size > 0:
                     tts_lm_model_kwargs = _update_model_kwargs_for_generation(
                         tts_lm_outputs, tts_lm_model_kwargs, num_new_tokens=next_text_window_size,
@@ -830,20 +875,30 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
                     tts_lm_model_kwargs = self._update_model_kwargs_for_generation(
                         tts_lm_outputs, tts_lm_model_kwargs, is_encoder_decoder=False,
                     )
-
-                tts_lm_negative_input_ids = torch.cat([tts_lm_negative_input_ids, torch.ones_like(tts_lm_input_ids[:, -1:])], dim=-1)
-                tts_lm_negative_model_inputs = self.prepare_inputs_for_generation(tts_lm_negative_input_ids, **tts_lm_negative_model_kwargs)
-                # Forward negative pass through the model
-                tts_lm_negative_additional_inputs = {
-                    "tts_text_masks": torch.zeros_like(tts_lm_negative_input_ids[:, -1:]),
-                    "lm_last_hidden_state": acoustic_embed,
-                }
-                tts_lm_negative_outputs = self.forward_tts_lm(
-                    **tts_lm_negative_model_inputs, **tts_lm_negative_additional_inputs, return_dict=True, output_attentions=False, output_hidden_states=False,
-                )
                 tts_lm_negative_model_kwargs = self._update_model_kwargs_for_generation(
                     tts_lm_negative_outputs, tts_lm_negative_model_kwargs, is_encoder_decoder=False,
                 )
+
+                # [VibePod] Resolve decode future (or run synchronously) then store
+                # and stream the audio chunk.
+                if _decode_executor is not None:
+                    audio_chunk = _decode_future.result()
+                else:
+                    audio_chunk = self.model.acoustic_tokenizer.decode(
+                        scaled_latent.to(self.model.acoustic_tokenizer.device),
+                        cache=acoustic_cache,
+                        sample_indices=diffusion_indices.to(self.model.acoustic_tokenizer.device),
+                        use_cache=True,
+                        debug=False,
+                    )
+
+                for i, sample_idx in enumerate(diffusion_indices):
+                    idx = sample_idx.item()
+                    if not finished_tags[idx]:
+                        audio_chunks[idx].append(audio_chunk[i])
+
+                if audio_streamer is not None:
+                    audio_streamer.put(audio_chunk, diffusion_indices)
 
                 tts_eos_logits = torch.sigmoid(self.tts_eos_classifier(tts_lm_outputs.last_hidden_state[diffusion_indices, -1, :]))
                 if tts_eos_logits[0].item() > 0.5:
